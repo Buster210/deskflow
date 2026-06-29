@@ -131,6 +131,8 @@ private:
   void showCursor();
   void hideCursor();
 
+  void checkNativeCursorIdle();
+
   // map deskflow mouse button to mac buttons
   ButtonID mapDeskflowButtonToMac(uint16_t) const;
 
@@ -251,6 +253,8 @@ private:
 
   bool m_cursorHidden;
 
+  CGEventTimestamp m_lastNativeCursorEventTime = 0; // CGEventGetTimestamp units
+
   // keyboard stuff
   OSXKeyState *m_keyState;
 
@@ -268,6 +272,7 @@ private:
 
   EventQueueTimer *m_axTimer;
 
+  EventQueueTimer *m_cursorIdleTimer = nullptr;
   // window object that gets user input events when the server
   // has focus.
   WindowRef m_hiddenWindow;
@@ -302,6 +307,9 @@ private:
   CFRunLoopSourceRef m_eventTapRLSR;
   std::thread m_eventTapThread;
   CFRunLoopRef m_eventTapRunLoop = nullptr;
+
+  // tags synthetic CGEvents so the secondary handler can distinguish them from hardware events
+  CGEventSourceRef m_fakeEventSource = nullptr;
 
   // for double click coalescing.
   double m_lastClickTime;
