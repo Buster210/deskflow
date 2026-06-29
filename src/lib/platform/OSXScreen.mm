@@ -108,6 +108,7 @@ OSXScreen::OSXScreen(IEventQueue *events, bool isPrimary, bool enableLangSync)
       m_activeModifierHotKeyMask(0),
       m_eventTapPort(nullptr),
       m_eventTapRLSR(nullptr),
+      m_fakeEventSource(CGEventSourceCreate(kCGEventSourceStatePrivate)),
       m_lastClickTime(0),
       m_clickState(1),
       m_lastSingleClickXCursor(0),
@@ -221,6 +222,11 @@ OSXScreen::~OSXScreen()
 
   delete m_carbonLoopMutex;
   delete m_carbonLoopReady;
+
+  if (m_fakeEventSource) {
+    CFRelease(m_fakeEventSource);
+    m_fakeEventSource = nullptr;
+  }
 }
 
 void *OSXScreen::getEventTarget() const
@@ -467,7 +473,7 @@ void OSXScreen::postMouseEvent(CGPoint &pos) const
     type = thisButtonType[kMouseButtonDragged];
   }
 
-  CGEventRef event = CGEventCreateMouseEvent(nullptr, type, pos, static_cast<CGMouseButton>(button));
+  CGEventRef event = CGEventCreateMouseEvent(m_fakeEventSource, type, pos, static_cast<CGMouseButton>(button));
 
   if (button != -1 && needsEventNumber()) {
     CGEventSetIntegerValueField(event, kCGMouseEventNumber, m_mouseEventNumber);
@@ -555,7 +561,7 @@ void OSXScreen::fakeMouseButton(ButtonID id, bool press)
   MouseButtonEventMapType thisButtonMap = MouseButtonEventMap[index];
   CGEventType type = thisButtonMap[state];
 
-  CGEventRef event = CGEventCreateMouseEvent(nullptr, type, pos, static_cast<CGMouseButton>(index));
+  CGEventRef event = CGEventCreateMouseEvent(m_fakeEventSource, type, pos, static_cast<CGMouseButton>(index));
 
   if (needsEventNumber()) {
     if (press) {
@@ -632,7 +638,8 @@ void OSXScreen::fakeMouseWheel(ScrollDelta delta) const
     );
     // create a scroll event, post it and release it.  not sure if kCGScrollEventUnitLine
     // is the right choice here over kCGScrollEventUnitPixel
-    CGEventRef scrollEvent = CGEventCreateScrollWheelEvent(nullptr, kCGScrollEventUnitLine, 2, delta.y, delta.x);
+    CGEventRef scrollEvent =
+        CGEventCreateScrollWheelEvent(m_fakeEventSource, kCGScrollEventUnitLine, 2, delta.y, delta.x);
 
     // Fix for sticky keys
     CGEventFlags modifiers = m_keyState->getModifierStateAsOSXFlags();
@@ -721,6 +728,9 @@ void OSXScreen::enable()
         kCGHIDEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault, kCGEventMaskForAllEvents,
         handleCGInputEventSecondary, this
     );
+
+    m_cursorIdleTimer = m_events->newTimer(0.01, nullptr);
+    m_events->addHandler(EventTypes::Timer, m_cursorIdleTimer, [this](const auto &) { checkNativeCursorIdle(); });
   }
 
   if (m_eventTapPort) {
@@ -786,6 +796,12 @@ void OSXScreen::disable()
     m_axTimer = nullptr;
   }
 
+  if (m_cursorIdleTimer != nullptr) {
+    m_events->removeHandler(EventTypes::Timer, m_cursorIdleTimer);
+    m_events->deleteTimer(m_cursorIdleTimer);
+    m_cursorIdleTimer = nullptr;
+  }
+
   m_isOnScreen = m_isPrimary;
 }
 
@@ -822,7 +838,13 @@ bool OSXScreen::canLeave()
 
 void OSXScreen::leave()
 {
-  hideCursor();
+  // only hide if we're actually transitioning onscreen->offscreen. hiding
+  // unconditionally let this fire twice in a row without a matching enter(),
+  // which double-decrements CGDisplayHideCursor's refcount; one showCursor()
+  // in enter() then can't rebalance it and the cursor stays hidden for good.
+  if (m_isOnScreen) {
+    hideCursor();
+  }
 
   if (m_isPrimary) {
     avoidHesitatingCursor();
@@ -1654,27 +1676,63 @@ bool OSXScreen::HotKeyItem::operator<(const HotKeyItem &x) const
   return (m_keycode < x.m_keycode || (m_keycode == x.m_keycode && m_mask < x.m_mask));
 }
 
-// Quartz event tap support for the secondary display. This makes sure that we
-// will show the cursor if a local event comes in while deskflow has the cursor
-// off the screen.
+static constexpr uint64_t kNativeCursorGraceNs = 40'000'000; // 40ms
+
+// Off-screen only: show cursor on local hardware input, re-hide after
+// kNativeCursorGraceNs idle. Never runs when focused (enter/leave own it).
 CGEventRef
 OSXScreen::handleCGInputEventSecondary(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon)
 {
-  // this fix is really screwing with the correct show/hide behavior. it
-  // should be tested better before reintroducing.
-  return event;
+  switch (type) {
+  case kCGEventMouseMoved:
+  case kCGEventLeftMouseDragged:
+  case kCGEventRightMouseDragged:
+  case kCGEventOtherMouseDragged:
+  case kCGEventLeftMouseDown:
+  case kCGEventLeftMouseUp:
+  case kCGEventRightMouseDown:
+  case kCGEventRightMouseUp:
+  case kCGEventOtherMouseDown:
+  case kCGEventOtherMouseUp:
+  case kCGEventScrollWheel:
+    break;
+  default:
+    return event;
+  }
 
-  OSXScreen *screen = (OSXScreen *)refcon;
-  if (screen->m_cursorHidden && type == kCGEventMouseMoved) {
+  auto *screen = static_cast<OSXScreen *>(refcon);
 
-    CGPoint pos = CGEventGetLocation(event);
-    if (pos.x != screen->m_xCenter || pos.y != screen->m_yCenter) {
+  if (screen->m_isOnScreen) {
+    // focused: enter()/leave() already handle show/hide, don't interfere.
+    return event;
+  }
 
-      LOG_DEBUG("show cursor on secondary, type=%d pos=%d,%d", type, pos.x, pos.y);
+  bool isSynthetic =
+      screen->m_fakeEventSource != nullptr && CGEventGetIntegerValueField(event, kCGEventSourceStateID) ==
+                                                  CGEventSourceGetSourceStateID(screen->m_fakeEventSource);
+
+  if (!isSynthetic) {
+    screen->m_lastNativeCursorEventTime = CGEventGetTimestamp(event);
+    if (screen->m_cursorHidden) {
+      LOG_DEBUG("show cursor on secondary, local input detected, type=%d", type);
       screen->showCursor();
     }
   }
+
   return event;
+}
+
+void OSXScreen::checkNativeCursorIdle()
+{
+  if (m_isOnScreen || m_cursorHidden) {
+    return;
+  }
+
+  uint64_t idleNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - m_lastNativeCursorEventTime;
+  if (idleNs > kNativeCursorGraceNs) {
+    LOG_DEBUG("hide cursor on secondary, local input idle");
+    hideCursor();
+  }
 }
 
 // Quartz event tap support
