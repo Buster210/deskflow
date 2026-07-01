@@ -225,6 +225,8 @@ private:
   // true if mouse has entered the screen
   bool m_isOnScreen;
 
+  bool m_lockCursorToClient = false;
+
   // the display
   CGDirectDisplayID m_displayID;
 

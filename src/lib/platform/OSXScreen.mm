@@ -129,6 +129,18 @@ OSXScreen::OSXScreen(IEventQueue *events, bool isPrimary, bool enableLangSync)
       m_powerManager.disableSleep();
     }
 
+    // QSettings can't be used here -- cleanSettings() prunes any key not in its known schema.
+    const QString lockCursorFile = Settings::settingsPath() + QStringLiteral("/lock-cursor");
+    if (NSString *lockContent = [NSString stringWithContentsOfFile:lockCursorFile.toNSString()
+                                                          encoding:NSUTF8StringEncoding
+                                                             error:nil]) {
+      m_lockCursorToClient =
+          [[lockContent stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] boolValue];
+    }
+    LOG_INFO(
+        "cursor lock-to-client: %s (%s)", m_lockCursorToClient ? "enabled" : "disabled",
+        lockCursorFile.toStdString().c_str());
+
     // only needed when running as a server.
     if (m_isPrimary) {
       // we can't pass options to show the dialog, this must be done by the gui.
@@ -833,6 +845,9 @@ void OSXScreen::enter()
 
 bool OSXScreen::canLeave()
 {
+  if (m_lockCursorToClient && !m_isPrimary) {
+    return false;
+  }
   return true;
 }
 

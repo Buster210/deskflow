@@ -23,6 +23,7 @@ deskflow-config.toml
 .env*
 /scripts/*.egg-info
 /*.user
+compile_commands.json
 *.ui.autosave
 
 #Qt creator 18 user files
