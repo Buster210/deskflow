@@ -1,0 +1,166 @@
+# Build all platforms on push to personal/macos-dmg only.
+# Workflow file lives on master so GitHub recognizes it.
+
+name: Build
+
+on:
+  push:
+    branches: [personal/macos-dmg]
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_CONFIGURE: >-
+    cmake -Bbuild -DCMAKE_BUILD_TYPE=Release
+    -DSKIP_BUILD_TESTS=ON
+    -DCMAKE_COMPILE_WARNING_AS_ERROR=OFF
+    -DCMAKE_C_COMPILER_LAUNCHER=ccache
+    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            runs-on: macos-15
+            qt-version: "6.11.1"
+            config-args: '-DCMAKE_OSX_ARCHITECTURES="arm64" -DCMAKE_OSX_DEPLOYMENT_TARGET=14'
+            artifact: dmg
+
+          - name: macos-x64
+            runs-on: macos-15-intel
+            qt-version: "6.9.3"
+            config-args: '-DCMAKE_OSX_ARCHITECTURES="x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=12'
+            artifact: dmg
+
+          - name: windows-x64
+            runs-on: windows-2022
+            qt-version: "6.10.3"
+            config-args: "-G Ninja"
+            vcpkg-triplet: x64-windows-release
+            arch: amd64
+            artifact: exe
+
+          - name: debian-x64
+            runs-on: ubuntu-latest
+            container: debian:stable-slim
+            like: debian
+            qt-version: "6.11.1"
+            config-args: "-G Ninja -DCMAKE_INSTALL_PREFIX=/usr"
+            artifact: deb
+
+          - name: fedora-x64
+            runs-on: ubuntu-latest
+            container: fedora:44
+            like: fedora
+            qt-version: "6.11.1"
+            config-args: "-G Ninja -DCMAKE_INSTALL_PREFIX=/usr"
+            artifact: rpm
+
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runs-on }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 30
+
+    steps:
+      - name: Install Git (container)
+        if: ${{ matrix.container }}
+        shell: bash
+        run: |
+          if command -v apt &>/dev/null; then
+            apt update -qq && apt install -qq -y git ccache file
+          elif command -v dnf &>/dev/null; then
+            dnf install -y git ccache
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Cache Homebrew (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: |
+            /opt/homebrew/opt/qt*
+            /opt/homebrew/Cellar/qt*
+          key: brew-qt-${{ matrix.qt-version }}-${{ runner.os }}-${{ runner.arch }}
+          restore-keys: |
+            brew-qt-${{ matrix.qt-version }}-${{ runner.os }}-
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.os == 'macOS' && '~/Library/Caches/ccache' || '~/.cache/ccache' }}
+          key: ccache-${{ matrix.name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.name }}-
+
+      - name: Setup MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: TheMrMilchmann/setup-msvc-dev@v4
+        with:
+          arch: ${{ matrix.arch || 'x64' }}
+
+      - name: Cache vcpkg (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\vcpkg\installed
+            C:\Users\runneradmin\AppData\Local\vcpkg\archtrees
+          key: vcpkg-${{ matrix.vcpkg-triplet }}-${{ hashFiles('vcpkg.json.in') }}
+          restore-keys: |
+            vcpkg-${{ matrix.vcpkg-triplet }}-
+
+      - name: Install dependencies
+        uses: ./.github/actions/install-dependencies
+        with:
+          qt-version: ${{ matrix.qt-version }}
+          vcpkg-triplet: ${{ matrix.vcpkg-triplet }}
+          like: ${{ matrix.like }}
+
+      - name: Install ccache (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ccache || true
+
+      - name: Get version
+        uses: ./.github/actions/get-version
+
+      - name: Configure
+        run: >-
+          ${{ env.CMAKE_CONFIGURE }}
+          ${{ matrix.config-args }}
+          -DPACKAGE_VERSION_LABEL="${{ env.DESKFLOW_PACKAGE_VERSION }}"
+
+      - name: Build
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            cmake --build build --config Release -j$(sysctl -n hw.ncpu)
+            for i in 1 2 3 4 5; do
+              cmake --build build --config Release -j$(sysctl -n hw.ncpu) --target package && break
+              sleep 1
+            done
+          elif [[ "${{ runner.os }}" == "Windows" ]]; then
+            cmake --build build --config Release -j8 --target package
+          else
+            cmake --build build --config Release -j$(nproc) --target package
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deskflow-${{ matrix.name }}-${{ env.DESKFLOW_PACKAGE_VERSION }}
+          path: |
+            build/*.dmg
+            build/*.exe
+            build/*.deb
+            build/*.rpm
+          if-no-files-found: warn
+          retention-days: 30
