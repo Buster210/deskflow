@@ -7,6 +7,12 @@
 # after everything else has touched the staging tree, so the seal sticks.
 # The .app sits under a CPack component-group dir (e.g. ALL_IN_ONE/), not at the
 # staging root -- glob both the root and one level down to catch either layout.
+# Only for free ad-hoc path — when APPLE_CODESIGN_DEV is set, CI signs/notarizes via Dev ID + notarytool
+if(APPLE_CODESIGN_DEV)
+  message(STATUS "resign.cmake: APPLE_CODESIGN_DEV set, skip ad-hoc re-sign")
+  return()
+endif()
+
 file(GLOB _apps
   "${CPACK_TEMPORARY_INSTALL_DIRECTORY}/*.app"
   "${CPACK_TEMPORARY_INSTALL_DIRECTORY}/*/*.app"
@@ -31,6 +37,6 @@ foreach(_app ${_apps})
     endif()
   endforeach()
   message(STATUS "Ad-hoc re-signing bundle: ${_app}")
-  execute_process(COMMAND codesign --force --deep --sign - "${_app}"
+  execute_process(COMMAND codesign --force --sign - "${_app}"
     COMMAND_ERROR_IS_FATAL ANY)
 endforeach()
