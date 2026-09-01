@@ -61,17 +61,26 @@ jobs:
             config-args: "-G Ninja -DCMAKE_INSTALL_PREFIX=/usr"
             artifact: rpm
 
+          - name: archlinux-x64
+            runs-on: ubuntu-latest
+            container: archlinux:latest
+            like: arch
+            qt-version: "6.11.1"
+            config-args: "-G Ninja -DCMAKE_INSTALL_PREFIX=/usr"
+            artifact: pkg.tar.zst
+
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runs-on }}
     container: ${{ matrix.container }}
     timeout-minutes: 30
-
     steps:
       - name: Install Git (container)
         if: ${{ matrix.container }}
         shell: bash
         run: |
-          if command -v apt &>/dev/null; then
+          if command -v pacman &>/dev/null; then
+            pacman -Syu --noconfirm git ccache
+          elif command -v apt &>/dev/null; then
             apt update -qq && apt install -qq -y git ccache file
           elif command -v dnf &>/dev/null; then
             dnf install -y git ccache
@@ -149,6 +158,16 @@ jobs:
             done
           elif [[ "${{ runner.os }}" == "Windows" ]]; then
             cmake --build build --config Release -j8 --target package
+          elif [[ "${{ matrix.like }}" == "arch" ]]; then
+            cmake --build build --config Release -j$(nproc)
+            useradd -m build
+            chown -R build build
+            cd build
+            sudo -u build makepkg -s --noconfirm
+            export OSNAME=$(cat /etc/os-release | grep ^ID= | sed 's/ID=//g')
+            export ARCH=$(uname -m)
+            mv *.pkg.tar.zst deskflow-${{ env.DESKFLOW_PACKAGE_VERSION }}-${OSNAME}-${ARCH}.pkg.tar.zst || true
+            cd ..
           else
             cmake --build build --config Release -j$(nproc) --target package
           fi
@@ -162,5 +181,6 @@ jobs:
             build/*.exe
             build/*.deb
             build/*.rpm
+            build/*.pkg.tar.zst
           if-no-files-found: warn
           retention-days: 30
